@@ -1,0 +1,22 @@
+[package]
+name = "devs-models"
+version = "0.1.0"
+edition = "2024"
+description = "DEVS models for the ANNSIM 2027 uBLOOM demonstration"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "devs_models"
+path = "src/lib.rs"
+
+[dependencies]
+xdevs-no-std = { git = "https://github.com/iscar-ucm/xdevs_no_std.rs", branch = "duration" }
+ubloom-model = { path = "../lstm_model" }
+
+[features]
+default = []
+# Embedded targets: xdevs' Embassy backend.
+embassy = ["xdevs-no-std/embassy"]
+# Hosted targets: xdevs' tokio backend.
+tokio = ["xdevs-no-std/tokio"]
