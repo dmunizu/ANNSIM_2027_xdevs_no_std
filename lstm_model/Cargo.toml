@@ -1,0 +1,12 @@
+[package]
+name = "ubloom-model"
+version = "0.1.0"
+edition = "2024"
+description = "uBLOOM bloom-forecasting LSTM, bit-exact reimplementation in integer Rust"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "ubloom_model"
+path = "src/lib.rs"
+
+[dependencies]
