@@ -16,6 +16,12 @@ pub struct ForecastSystem {
     alert: ThresholdAlert,
 }
 
+impl ForecastSystem {
+    pub fn new(threshold: f32) -> Self {
+        Self::build(Forecaster::new(), ThresholdAlert::new(threshold))
+    }
+}
+
 // RtEngine attributes change depending on the target.
 #[cfg_attr(feature = "embassy", xdevs::rt_engine(max_out_subs = 2))]
 #[cfg_attr(all(feature = "tokio", not(feature = "embassy")), xdevs::rt_engine)]
