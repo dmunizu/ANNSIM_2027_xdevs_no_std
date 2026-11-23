@@ -43,13 +43,14 @@ const SSID: &str = "my-ssid";
 const PASSWORD: &str = "my-password";
 const BROKER: IpEndpoint = IpEndpoint::new(IpAddress::v4(192, 168, 1, 10), 1883);
 const CLIENT_ID: &str = "esp32";
-const TOPIC: &str = "annsim_2027_xdevs/out";
+const TOPIC_FORECASTS: &str = "annsim_2027_xdevs/forecasts";
+const TOPIC_ALERTS: &str = "annsim_2027_xdevs/alerts";
 // Keepalive offered in CONNECT; the broker disconnects after 1.5x this without traffic.
 const KEEP_ALIVE_SECS: u16 = 60;
 // PINGREQ interval, comfortably below the keepalive the broker enforces.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
-/// Upper bound for the formatted forecast: one signed, 3-decimal value per horizon.
+/// Upper bound for a formatted payload.
 const PAYLOAD_LEN: usize = 64;
 
 static NET_RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
@@ -116,32 +117,41 @@ async fn mqtt_task(stack: Stack<'static>, mut receiver: ForecastSystemReceiver) 
             continue;
         }
 
-        let topic = TopicName::new(MqttString::from_str(TOPIC).expect("valid topic"))
+        let forecasts_topic =
+            TopicName::new(MqttString::from_str(TOPIC_FORECASTS).expect("valid topic"))
+                .expect("valid topic name");
+        let alerts_topic = TopicName::new(MqttString::from_str(TOPIC_ALERTS).expect("valid topic"))
             .expect("valid topic name");
 
         loop {
             match embassy_time::with_timeout(PING_INTERVAL, receiver.recv()).await {
-                // Lagged means the model outran the subscriber; the newest forecast follows.
+                // Lagged means the model outran the subscriber, the newest forecast follows.
                 Ok(Err(_lagged)) => {}
-                // Alerts are not part of the published payload.
-                Ok(Ok(ForecastSystemOutputEnum::Alerts(_))) => {}
-                Ok(Ok(ForecastSystemOutputEnum::Forecast(forecast))) => {
+                Ok(Ok(event)) => {
                     let mut payload = heapless::String::<PAYLOAD_LEN>::new();
                     let mut fits = true;
-                    for (index, value) in forecast.iter().enumerate() {
-                        if index > 0 {
-                            fits &= payload.push(',').is_ok();
+                    let target = match event {
+                        ForecastSystemOutputEnum::Forecast(forecast) => {
+                            for (index, value) in forecast.iter().enumerate() {
+                                if index > 0 {
+                                    fits &= payload.push(',').is_ok();
+                                }
+                                fits &= write!(payload, "{value}").is_ok();
+                            }
+                            TopicReference::Name(forecasts_topic.as_borrowed())
                         }
-                        fits &= write!(payload, "{value}").is_ok();
-                    }
+                        ForecastSystemOutputEnum::Alerts((horizon, alert)) => {
+                            fits &= write!(payload, "{horizon},{alert}").is_ok();
+                            TopicReference::Name(alerts_topic.as_borrowed())
+                        }
+                    };
                     if !fits {
                         continue;
                     }
 
-                    // Reclaim the encoder workspace; the previous PUBLISH is already written.
+                    // Reclaim the bump space held by the last inbound packet.
                     unsafe { client.buffer_mut().reset() };
-                    let publication =
-                        PublicationOptions::new(TopicReference::Name(topic.as_borrowed()));
+                    let publication = PublicationOptions::new(target);
                     if client
                         .publish(&publication, Bytes::from(payload.as_bytes()))
                         .await
@@ -158,6 +168,7 @@ async fn mqtt_task(stack: Stack<'static>, mut receiver: ForecastSystemReceiver) 
                 }
             }
 
+            // If the link or config goes down, drop the session and wait for a new connection.
             if !stack.is_link_up() || !stack.is_config_up() {
                 break;
             }
