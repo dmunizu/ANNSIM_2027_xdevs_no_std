@@ -7,14 +7,15 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use core::{fmt::Write as _, num::NonZero};
+use core::{fmt::Write as _, mem::size_of, num::NonZero};
 
 use devs_models::ForecastSystem;
-use devs_models::system::{ForecastSystemOutputEnum, ForecastSystemReceiver};
+use devs_models::forecast::Window;
+use devs_models::system::{ForecastSystemOutputEnum, ForecastSystemReceiver, ForecastSystemSender};
 use embassy_executor::Spawner;
 use embassy_net::{IpAddress, IpEndpoint, Runner, Stack, tcp::TcpSocket};
 use embassy_time::{Duration, Timer};
-use esp_hal::{clock::CpuClock, rng::Rng, timer::timg::TimerGroup};
+use esp_hal::{clock::CpuClock, rng::Rng, timer::timg::TimerGroup, uart::Uart};
 use esp_radio::wifi::{Config as WifiConfig, Interface, WifiController, sta::StationConfig};
 use rust_mqtt::{
     Bytes,
@@ -49,9 +50,12 @@ const TOPIC_ALERTS: &str = "annsim_2027_xdevs/alerts";
 const KEEP_ALIVE_SECS: u16 = 60;
 // PINGREQ interval, comfortably below the keepalive the broker enforces.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-
 /// Upper bound for a formatted payload.
 const PAYLOAD_LEN: usize = 64;
+/// One window on the wire: one int8 per feature.
+const WINDOW_LEN: usize = size_of::<Window>();
+/// Frame marker written before every window.
+const FRAME_SYNC: u8 = 0xAA;
 
 static NET_RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
 
@@ -176,6 +180,33 @@ async fn mqtt_task(stack: Stack<'static>, mut receiver: ForecastSystemReceiver) 
     }
 }
 
+/// Feeds windows received over UART into the DEVS engine's input channel.
+#[embassy_executor::task]
+async fn uart_task(mut uart: Uart<'static, esp_hal::Async>, input: ForecastSystemSender) {
+    let mut raw = [0u8; WINDOW_LEN];
+    loop {
+        // Resynchronise on the marker.
+        let mut marker = [0u8; 1];
+        loop {
+            if uart.read_exact_async(&mut marker).await.is_err() {
+                continue;
+            }
+            if marker[0] == FRAME_SYNC {
+                break;
+            }
+        }
+
+        if uart.read_exact_async(&mut raw).await.is_err() {
+            continue;
+        }
+
+        let window: Window = raw.map(|byte| byte as i8);
+
+        // Blocks while the engine still holds the previous window (channel depth 1).
+        let _ = input.send(window).await;
+    }
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -214,12 +245,19 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
+    // UART setup for receiving the window to feed the DEVS simulation.
+    let uart = Uart::new(peripherals.UART0, Default::default())
+        .expect("UART init failed")
+        .with_rx(peripherals.GPIO16)
+        .into_async();
+
     // DEVS model setup
     let forecast_system = ForecastSystem::new(0.5);
     let mut rt_engine = forecast_system.into_rt_engine();
     let sim_config = xdevs::RtConfig::<xdevs::export::Clock>::default();
 
-    // Subscribe before the engine runs.
+    // Take both channel ends before the engine runs: `simulate_rt` borrows it mutably.
+    let input = rt_engine.sender();
     let receiver = rt_engine
         .receiver()
         .expect("output channel subscriber slot");
@@ -228,6 +266,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).expect("failed to spawn network task"));
     spawner.spawn(wifi_task(wifi_controller).expect("failed to spawn Wi-Fi task"));
     spawner.spawn(mqtt_task(stack, receiver).expect("failed to spawn MQTT task"));
+    spawner.spawn(uart_task(uart, input).expect("failed to spawn UART task"));
 
     // Run the DEVS simulation.
     rt_engine
